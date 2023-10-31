@@ -8,6 +8,8 @@ And please only add new entries to the top of this list, right below the `# Unre
 
 # Unreleased
 
+- On Windows, fix so `drag_window` and `drag_resize_window` can be called from another thread.
+
 # 0.28.7
 
 - Fix window size sometimes being invalid when resizing on macOS 14 Sonoma.

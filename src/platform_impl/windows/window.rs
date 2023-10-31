@@ -406,28 +406,48 @@ impl Window {
         Ok(())
     }
 
-    #[inline]
-    pub fn drag_window(&self) -> Result<(), ExternalError> {
-        unsafe {
+    unsafe fn handle_os_dragging(&self, wparam: WPARAM) {
+        let hwnd = self.hwnd();
+        let window_state = self.window_state.clone();
+
+        self.thread_executor.execute_in_thread(move || {
+            {
+                let mut guard = window_state.lock().unwrap();
+                if !guard.dragging {
+                    guard.dragging = true;
+                } else {
+                    return;
+                }
+            }
+
             let points = {
-                let mut pos = mem::zeroed();
-                GetCursorPos(&mut pos);
+                let mut pos = unsafe { mem::zeroed() };
+                unsafe { GetCursorPos(&mut pos) };
                 pos
             };
             let points = POINTS {
                 x: points.x as i16,
                 y: points.y as i16,
             };
-            ReleaseCapture();
 
-            self.window_state_lock().dragging = true;
+            // ReleaseCapture needs to execute on the main thread
+            unsafe { ReleaseCapture() };
 
-            PostMessageW(
-                self.hwnd(),
-                WM_NCLBUTTONDOWN,
-                HTCAPTION as WPARAM,
-                &points as *const _ as LPARAM,
-            );
+            unsafe {
+                PostMessageW(
+                    hwnd,
+                    WM_NCLBUTTONDOWN,
+                    wparam,
+                    &points as *const _ as LPARAM,
+                )
+            };
+        });
+    }
+
+    #[inline]
+    pub fn drag_window(&self) -> Result<(), ExternalError> {
+        unsafe {
+            self.handle_os_dragging(HTCAPTION as WPARAM);
         }
 
         Ok(())
