@@ -39,6 +39,7 @@ pub mod x11;
     windows_platform,
     macos_platform,
     android_platform,
+    ios_platform,
     x11_platform,
     wayland_platform
 ))]
@@ -48,6 +49,7 @@ pub mod run_on_demand;
     windows_platform,
     macos_platform,
     android_platform,
+    ios_platform,
     x11_platform,
     wayland_platform
 ))]
