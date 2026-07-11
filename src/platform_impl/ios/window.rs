@@ -109,11 +109,15 @@ impl Inner {
     }
 
     pub fn inner_size(&self) -> PhysicalSize<u32> {
+        // Return the full screen bounds (like `outer_size`), NOT the safe area. The Metal
+        // swapchain sizes its drawable to the full view bounds, so reporting the smaller safe-area
+        // size here made egui/renderers lay out at the wrong size and aspect (overlay clipped, 3D
+        // stretched). Safe-area insets are a separate concern handled by UI element placement.
         let scale_factor = self.scale_factor();
-        let safe_area = self.safe_area_screen_space();
+        let screen_frame = self.screen_frame();
         let size = LogicalSize {
-            width: safe_area.size.width as f64,
-            height: safe_area.size.height as f64,
+            width: screen_frame.size.width as f64,
+            height: screen_frame.size.height as f64,
         };
         size.to_physical(scale_factor)
     }
