@@ -742,7 +742,10 @@ pub(crate) fn handle_nonuser_events<I: IntoIterator<Item = EventWrapper>>(
                 if !processing_redraws && event.is_redraw() {
                     log::info!("processing `RedrawRequested` during the main event loop");
                 } else if processing_redraws && !event.is_redraw() {
-                    log::warn!(
+                    // Expected on iOS: our `pump_events` port delivers lifecycle events like
+                    // `AboutToWait` during the redraw phase, so this fires every frame. Kept at
+                    // trace so it stays discoverable without spamming.
+                    log::trace!(
                         "processing non `RedrawRequested` event after the main event loop: {:#?}",
                         event
                     );
@@ -798,7 +801,8 @@ pub(crate) fn handle_nonuser_events<I: IntoIterator<Item = EventWrapper>>(
                     if !processing_redraws && event.is_redraw() {
                         log::info!("processing `RedrawRequested` during the main event loop");
                     } else if processing_redraws && !event.is_redraw() {
-                        log::warn!(
+                        // See the note above: expected every frame under our iOS pump model.
+                        log::trace!(
                             "processing non-`RedrawRequested` event after the main event loop: {:#?}",
                             event
                         );
