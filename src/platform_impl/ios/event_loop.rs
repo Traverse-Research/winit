@@ -5,14 +5,16 @@ use std::{
     marker::PhantomData,
     ptr,
     sync::mpsc::{self, Receiver, Sender},
+    time::{Duration, Instant},
 };
 
-use core_foundation::base::{CFIndex, CFRelease};
+use core_foundation::base::{Boolean, CFIndex, CFRelease};
 use core_foundation::runloop::{
     kCFRunLoopAfterWaiting, kCFRunLoopBeforeWaiting, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
     kCFRunLoopExit, CFRunLoopActivity, CFRunLoopAddObserver, CFRunLoopAddSource, CFRunLoopGetMain,
-    CFRunLoopObserverCreate, CFRunLoopObserverRef, CFRunLoopSourceContext, CFRunLoopSourceCreate,
-    CFRunLoopSourceInvalidate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopWakeUp,
+    CFRunLoopObserverCreate, CFRunLoopObserverRef, CFRunLoopRunInMode, CFRunLoopSourceContext,
+    CFRunLoopSourceCreate, CFRunLoopSourceInvalidate, CFRunLoopSourceRef, CFRunLoopSourceSignal,
+    CFRunLoopWakeUp,
 };
 use icrate::Foundation::{MainThreadMarker, NSString};
 use objc2::ClassType;
@@ -24,7 +26,7 @@ use crate::{
         ControlFlow, DeviceEvents, EventLoopClosed,
         EventLoopWindowTarget as RootEventLoopWindowTarget,
     },
-    platform::ios::Idiom,
+    platform::{ios::Idiom, pump_events::PumpStatus},
 };
 
 use super::{app_state, monitor, view, MonitorHandle};
@@ -77,12 +79,18 @@ impl<T: 'static> EventLoopWindowTarget<T> {
 
     pub(crate) fn exit(&self) {
         // https://developer.apple.com/library/archive/qa/qa1561/_index.html
-        // it is not possible to quit an iOS app gracefully and programatically
-        warn!("`ControlFlow::Exit` ignored on iOS");
+        // It is not possible to quit an iOS app gracefully and programatically, so `exit()` cannot
+        // terminate the process. It does, however, request that a `run_on_demand` / `pump_events`
+        // driver returns control to its caller, which is the meaningful notion of "exit" there.
+        app_state::request_exit(self.mtm);
     }
 
     pub(crate) fn exiting(&self) -> bool {
-        false
+        app_state::exit_requested(self.mtm)
+    }
+
+    pub(crate) fn clear_exit(&self) {
+        app_state::clear_exit(self.mtm)
     }
 }
 
@@ -171,12 +179,146 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
+    /// Pump a single slice of the run loop, dispatching any pending events to `event_handler`.
+    ///
+    /// Unlike [`run`](Self::run), this returns control to the caller. It must be called from within
+    /// the entry point started by [`ios_application_main`] (i.e. after `UIApplicationMain` is
+    /// already running), since it cannot start `UIApplicationMain` itself (that call never returns).
+    pub fn pump_events<F>(&mut self, timeout: Option<Duration>, event_handler: F) -> PumpStatus
+    where
+        F: FnMut(Event<T>, &RootEventLoopWindowTarget<T>),
+    {
+        assert!(
+            UIApplication::shared(self.mtm).is_some(),
+            "`pump_events`/`run_on_demand` on iOS must be called from within the entry point passed \
+             to `winit::platform::ios::ios_application_main`, after `UIApplicationMain` has started",
+        );
+
+        // Erase the borrowed closure's lifetime for the duration of this call. This is sound because
+        // the handler is removed (and dropped) via `take_handler` before we return, so it never
+        // outlives the borrow. Mirrors the `transmute` done in `run`.
+        let event_handler = unsafe {
+            std::mem::transmute::<
+                Box<dyn FnMut(Event<T>, &RootEventLoopWindowTarget<T>)>,
+                Box<EventHandlerCallback<T>>,
+            >(Box::new(event_handler))
+        };
+        let handler = DriverEventLoopHandler {
+            f: event_handler,
+            receiver: &self.receiver,
+            event_loop: RootEventLoopWindowTarget {
+                p: EventLoopWindowTarget {
+                    mtm: self.mtm,
+                    p: PhantomData,
+                },
+                _marker: PhantomData,
+            },
+        };
+
+        app_state::install_handler(self.mtm, Box::new(handler));
+
+        // `returnAfterSourceHandled = false`: run for up to `seconds` so the `BeforeWaiting`
+        // run-loop observers (which drive winit's `RedrawRequested`/`AboutToWait` cycle and the
+        // transition back to a waiting state) actually fire before we return. An unbounded timeout
+        // would suppress that cycle, so `None` is capped.
+        //
+        // TODO(ios): validate/tune this on device — the correct blocking behaviour vs. observer
+        // firing is subtle and can only be verified against a real UIKit run loop.
+        let seconds = match timeout {
+            Some(timeout) => timeout.as_secs_f64(),
+            None => 1.0,
+        }
+        .max(0.0);
+        unsafe {
+            let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false as Boolean);
+        }
+
+        // End the borrow before returning.
+        drop(app_state::take_handler(self.mtm));
+
+        if app_state::exit_requested(self.mtm) {
+            PumpStatus::Exit(0)
+        } else {
+            PumpStatus::Continue
+        }
+    }
+
+    /// Run the event loop until [`exit`](RootEventLoopWindowTarget::exit) is requested, then return
+    /// control to the caller. See [`pump_events`](Self::pump_events) for the iOS entry-point
+    /// requirement.
+    pub fn run_on_demand<F>(&mut self, mut event_handler: F) -> Result<(), EventLoopError>
+    where
+        F: FnMut(Event<T>, &RootEventLoopWindowTarget<T>),
+    {
+        loop {
+            // Choose how long a single slice may block based on the current `ControlFlow`. The
+            // internal waker timer additionally wakes the loop for `Poll`/`WaitUntil`.
+            let timeout = match self.window_target.p.control_flow() {
+                ControlFlow::Poll => Some(Duration::ZERO),
+                ControlFlow::Wait => None,
+                ControlFlow::WaitUntil(instant) => {
+                    Some(instant.saturating_duration_since(Instant::now()))
+                }
+            };
+            if let PumpStatus::Exit(_) = self.pump_events(timeout, &mut event_handler) {
+                break;
+            }
+        }
+        // Allow the loop to be run again later.
+        app_state::clear_exit(self.mtm);
+        Ok(())
+    }
+
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         EventLoopProxy::new(self.sender.clone())
     }
 
     pub fn window_target(&self) -> &RootEventLoopWindowTarget<T> {
         &self.window_target
+    }
+}
+
+/// Owns the process `main` on iOS: starts `UIApplicationMain` (which never returns) and, once the
+/// app has finished launching, invokes `entry` as a fresh run-loop callback — the same structure
+/// SDL uses (`SDL_UIKitRunApp` → `postFinishLaunch` → the user's `main`). `entry` is where you
+/// create the [`EventLoop`] and call [`run_on_demand`](EventLoop::run_on_demand) /
+/// [`pump_events`](EventLoop::pump_events).
+pub fn ios_application_main(entry: fn()) -> ! {
+    let mtm =
+        MainThreadMarker::new().expect("`ios_application_main` must be called on the main thread");
+    unsafe {
+        assert!(
+            UIApplication::shared(mtm).is_none(),
+            "`ios_application_main` cannot be called after `UIApplicationMain`",
+        );
+        PUMP_ENTRY = Some(entry);
+
+        // Ensure application delegate is initialized
+        view::WinitApplicationDelegate::class();
+
+        UIApplicationMain(
+            0,
+            ptr::null(),
+            None,
+            Some(&NSString::from_str("WinitApplicationDelegate")),
+        );
+        unreachable!()
+    }
+}
+
+// Set by `ios_application_main` before `UIApplicationMain`, read by the app delegate to (a) detect
+// that we are in `pump`/`on-demand` mode rather than diverging `run` mode, and (b) run the user's
+// entry point after launch. iOS UIKit is single-threaded (main thread only), so a plain `static mut`
+// matches the existing `SINGLETON_INIT` pattern in this file.
+static mut PUMP_ENTRY: Option<fn()> = None;
+
+pub(crate) fn has_pump_entry() -> bool {
+    unsafe { PUMP_ENTRY.is_some() }
+}
+
+pub(crate) fn run_pump_entry() {
+    if let Some(entry) = unsafe { PUMP_ENTRY.take() } {
+        entry();
     }
 }
 
@@ -374,6 +516,37 @@ impl<T: 'static> EventHandler for EventLoopHandler<T> {
 
     fn handle_user_events(&mut self) {
         for event in self.receiver.try_iter() {
+            (self.f)(Event::UserEvent(event), &self.event_loop);
+        }
+    }
+}
+
+// Like `EventLoopHandler`, but for the `run_on_demand`/`pump_events` drivers, which borrow (rather
+// than own) the `EventLoop`. The receiver is borrowed via a pointer; the handler is always removed
+// and dropped before the driver call returns, so the borrow stays valid.
+struct DriverEventLoopHandler<T: 'static> {
+    f: Box<EventHandlerCallback<T>>,
+    receiver: *const Receiver<T>,
+    event_loop: RootEventLoopWindowTarget<T>,
+}
+
+impl<T: 'static> Debug for DriverEventLoopHandler<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DriverEventLoopHandler")
+            .field("event_loop", &self.event_loop)
+            .finish()
+    }
+}
+
+impl<T: 'static> EventHandler for DriverEventLoopHandler<T> {
+    fn handle_nonuser_event(&mut self, event: Event<Never>) {
+        (self.f)(event.map_nonuser_event().unwrap(), &self.event_loop);
+    }
+
+    fn handle_user_events(&mut self) {
+        // SAFETY: the borrowed `EventLoop` outlives this handler (removed before the driver returns).
+        let receiver = unsafe { &*self.receiver };
+        for event in receiver.try_iter() {
             (self.f)(Event::UserEvent(event), &self.event_loop);
         }
     }
