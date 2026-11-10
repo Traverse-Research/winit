@@ -126,6 +126,12 @@ pub(crate) struct AppState {
     app_state: Option<AppStateImpl>,
     control_flow: ControlFlow,
     waker: EventLoopWaker,
+    // Set when the user requests `exit()`. Only observed by the `run_on_demand` /
+    // `pump_events` drivers, since a real iOS app can never terminate its process.
+    exit_requested: bool,
+    // Whether `NewEvents(StartCause::Init)` has already been dispatched. Used so that
+    // repeated `run_on_demand` / `pump_events` handler installs don't re-emit `Init`.
+    has_sent_init: bool,
 }
 
 impl AppState {
@@ -149,6 +155,8 @@ impl AppState {
                     }),
                     control_flow: ControlFlow::default(),
                     waker,
+                    exit_requested: false,
+                    has_sent_init: false,
                 });
             }
             init_guard(&mut guard);
@@ -463,6 +471,71 @@ impl AppState {
     pub(crate) fn control_flow(&self) -> ControlFlow {
         self.control_flow
     }
+
+    pub(crate) fn request_exit(&mut self) {
+        self.exit_requested = true;
+    }
+
+    pub(crate) fn clear_exit(&mut self) {
+        self.exit_requested = false;
+    }
+
+    pub(crate) fn exit_requested(&self) -> bool {
+        self.exit_requested
+    }
+
+    // Installs an event handler for a `run_on_demand` / `pump_events` driver, moving out of the
+    // handler-less `NotLaunched` state that `pump`-mode launch leaves us in. Returns the windows
+    // and events that were queued before the handler existed, so the caller can flush them (mirrors
+    // `did_finish_launching_transition`).
+    fn install_handler_transition(
+        &mut self,
+        event_handler: Box<dyn EventHandler>,
+    ) -> (Vec<Id<WinitUIWindow>>, Vec<EventWrapper>) {
+        let (queued_windows, queued_events, queued_gpu_redraws) = match self.take_state() {
+            AppStateImpl::NotLaunched {
+                queued_windows,
+                queued_events,
+                queued_gpu_redraws,
+            } => (queued_windows, queued_events, queued_gpu_redraws),
+            s => bug!("unexpected state while installing pump handler {:?}", s),
+        };
+        self.set_state(AppStateImpl::ProcessingEvents {
+            event_handler,
+            active_control_flow: self.control_flow,
+            queued_gpu_redraws,
+        });
+        (queued_windows, queued_events)
+    }
+
+    // Removes the event handler at the end of a `run_on_demand` / `pump_events` slice, returning to
+    // the handler-less `NotLaunched` state. Any GPU redraws still queued are preserved.
+    fn take_handler_transition(&mut self) -> Box<dyn EventHandler> {
+        let (event_handler, queued_gpu_redraws) = match self.take_state() {
+            AppStateImpl::ProcessingEvents {
+                event_handler,
+                queued_gpu_redraws,
+                ..
+            } => (event_handler, queued_gpu_redraws),
+            AppStateImpl::ProcessingRedraws { event_handler, .. } => {
+                (event_handler, Default::default())
+            }
+            AppStateImpl::Waiting {
+                waiting_event_handler,
+                ..
+            } => (waiting_event_handler, Default::default()),
+            AppStateImpl::PollFinished {
+                waiting_event_handler,
+            } => (waiting_event_handler, Default::default()),
+            s => bug!("unexpected state while removing pump handler {:?}", s),
+        };
+        self.set_state(AppStateImpl::NotLaunched {
+            queued_windows: Vec::new(),
+            queued_events: Vec::new(),
+            queued_gpu_redraws,
+        });
+        event_handler
+    }
 }
 
 pub(crate) fn set_key_window(mtm: MainThreadMarker, window: &Id<WinitUIWindow>) {
@@ -569,6 +642,61 @@ pub fn did_finish_launching(mtm: MainThreadMarker) {
     }
 }
 
+// `pump`/`on-demand`-mode launch: the app has finished launching but no event handler exists yet
+// (it is installed later by the driver). We only need to ensure `AppState` (and its waker timer on
+// the main run loop) is initialized; the state stays `NotLaunched` until `install_handler`.
+pub fn did_finish_launching_pump(mtm: MainThreadMarker) {
+    let _ = AppState::get_mut(mtm);
+}
+
+// Installs the event handler supplied to a `run_on_demand` / `pump_events` driver. Unlike
+// `did_finish_launching` (used by the diverging `run`), the handler is not known at
+// `UIApplicationMain` time, so this is called from within the driver after the app has launched.
+// It flushes windows/events that were queued while handler-less and emits `Init` exactly once.
+pub fn install_handler(mtm: MainThreadMarker, event_handler: Box<dyn EventHandler>) {
+    let mut this = AppState::get_mut(mtm);
+    let send_init = !this.has_sent_init;
+    this.has_sent_init = true;
+    this.waker.start();
+    let (windows, events) = this.install_handler_transition(event_handler);
+    drop(this);
+
+    for window in &windows {
+        // Same "screen dance" as `did_finish_launching`, to fix up windows that were created
+        // before the handler (and possibly before the first frame) existed.
+        let screen = window.screen();
+        let _: () = unsafe { msg_send![window, setScreen: ptr::null::<AnyObject>()] };
+        window.setScreen(&screen);
+
+        let controller = window.rootViewController();
+        window.setRootViewController(None);
+        window.setRootViewController(controller.as_deref());
+
+        window.makeKeyAndVisible();
+    }
+
+    let init = send_init.then(|| EventWrapper::StaticEvent(Event::NewEvents(StartCause::Init)));
+    handle_nonuser_events(mtm, init.into_iter().chain(events));
+}
+
+// Removes the event handler at the end of a `run_on_demand` / `pump_events` driver, so control can
+// return to the caller. The handler is handed back so the driver can drop it (ending the borrow).
+pub fn take_handler(mtm: MainThreadMarker) -> Box<dyn EventHandler> {
+    AppState::get_mut(mtm).take_handler_transition()
+}
+
+pub fn request_exit(mtm: MainThreadMarker) {
+    AppState::get_mut(mtm).request_exit()
+}
+
+pub fn clear_exit(mtm: MainThreadMarker) {
+    AppState::get_mut(mtm).clear_exit()
+}
+
+pub fn exit_requested(mtm: MainThreadMarker) -> bool {
+    AppState::get_mut(mtm).exit_requested()
+}
+
 // AppState::did_finish_launching handles the special transition `Init`
 pub fn handle_wakeup_transition(mtm: MainThreadMarker) {
     let mut this = AppState::get_mut(mtm);
@@ -614,7 +742,10 @@ pub(crate) fn handle_nonuser_events<I: IntoIterator<Item = EventWrapper>>(
                 if !processing_redraws && event.is_redraw() {
                     log::info!("processing `RedrawRequested` during the main event loop");
                 } else if processing_redraws && !event.is_redraw() {
-                    log::warn!(
+                    // Expected on iOS: our `pump_events` port delivers lifecycle events like
+                    // `AboutToWait` during the redraw phase, so this fires every frame. Kept at
+                    // trace so it stays discoverable without spamming.
+                    log::trace!(
                         "processing non `RedrawRequested` event after the main event loop: {:#?}",
                         event
                     );
@@ -670,7 +801,8 @@ pub(crate) fn handle_nonuser_events<I: IntoIterator<Item = EventWrapper>>(
                     if !processing_redraws && event.is_redraw() {
                         log::info!("processing `RedrawRequested` during the main event loop");
                     } else if processing_redraws && !event.is_redraw() {
-                        log::warn!(
+                        // See the note above: expected every frame under our iOS pump model.
+                        log::trace!(
                             "processing non-`RedrawRequested` event after the main event loop: {:#?}",
                             event
                         );

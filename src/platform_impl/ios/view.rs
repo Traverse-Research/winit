@@ -6,9 +6,10 @@ use icrate::Foundation::{CGFloat, CGRect, MainThreadMarker, NSObject, NSObjectPr
 use objc2::declare::{Ivar, IvarDrop};
 use objc2::rc::Id;
 use objc2::runtime::AnyClass;
-use objc2::{declare_class, extern_methods, msg_send, msg_send_id, mutability, ClassType};
+use objc2::{declare_class, extern_methods, msg_send, msg_send_id, mutability, sel, ClassType};
 
 use super::app_state::{self, EventWrapper};
+use super::event_loop;
 use super::uikit::{
     UIApplication, UIDevice, UIEvent, UIForceTouchCapability, UIInterfaceOrientationMask,
     UIResponder, UIStatusBarStyle, UITouch, UITouchPhase, UITouchType, UITraitCollection, UIView,
@@ -522,8 +523,29 @@ declare_class!(
     unsafe impl WinitApplicationDelegate {
         #[method(application:didFinishLaunchingWithOptions:)]
         fn did_finish_launching(&self, _application: &UIApplication, _: *mut NSObject) -> bool {
-            app_state::did_finish_launching(MainThreadMarker::new().unwrap());
+            let mtm = MainThreadMarker::new().unwrap();
+            if event_loop::has_pump_entry() {
+                // `pump_events`/`run_on_demand` mode: there is no event handler yet (the user
+                // installs one from the entry point). Launch handler-less and schedule the entry
+                // to run as a fresh run-loop callback, mirroring SDL's `postFinishLaunch`.
+                app_state::did_finish_launching_pump(mtm);
+                let _: () = unsafe {
+                    msg_send![
+                        self,
+                        performSelector: sel!(winitRunPumpEntry:),
+                        withObject: std::ptr::null::<NSObject>(),
+                        afterDelay: 0.0f64,
+                    ]
+                };
+            } else {
+                app_state::did_finish_launching(mtm);
+            }
             true
+        }
+
+        #[method(winitRunPumpEntry:)]
+        fn winit_run_pump_entry(&self, _sender: *mut NSObject) {
+            event_loop::run_pump_entry();
         }
 
         #[method(applicationDidBecomeActive:)]
