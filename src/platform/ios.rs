@@ -19,12 +19,14 @@ use crate::{
 /// [`pump_events`](crate::platform::pump_events::EventLoopExtPumpEvents::pump_events) from within
 /// `entry`.
 ///
-/// This mirrors SDL's iOS bootstrap (`SDL_UIKitRunApp` → `postFinishLaunch` → the user's `main`).
+/// This mirrors SDL's iOS bootstrap (`SDL_UIKitRunApp` → `postFinishLaunch` → the user's `main`),
+/// including its exit: once `entry` returns, the process exits with its return value as the exit
+/// code, as it would when returning from `main` on other platforms.
 ///
 /// This function never returns.
 ///
 /// [`run`]: EventLoop::run
-pub fn ios_application_main(entry: fn()) -> ! {
+pub fn ios_application_main(entry: fn() -> i32) -> ! {
     crate::platform_impl::ios_application_main(entry)
 }
 
