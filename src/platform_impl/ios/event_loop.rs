@@ -282,8 +282,9 @@ impl<T: 'static> EventLoop<T> {
 /// app has finished launching, invokes `entry` as a fresh run-loop callback — the same structure
 /// SDL uses (`SDL_UIKitRunApp` → `postFinishLaunch` → the user's `main`). `entry` is where you
 /// create the [`EventLoop`] and call [`run_on_demand`](EventLoop::run_on_demand) /
-/// [`pump_events`](EventLoop::pump_events).
-pub fn ios_application_main(entry: fn()) -> ! {
+/// [`pump_events`](EventLoop::pump_events). Like SDL's `postFinishLaunch`, the process exits with
+/// `entry`'s return value once it returns.
+pub fn ios_application_main(entry: fn() -> i32) -> ! {
     let mtm =
         MainThreadMarker::new().expect("`ios_application_main` must be called on the main thread");
     unsafe {
@@ -310,7 +311,7 @@ pub fn ios_application_main(entry: fn()) -> ! {
 // that we are in `pump`/`on-demand` mode rather than diverging `run` mode, and (b) run the user's
 // entry point after launch. iOS UIKit is single-threaded (main thread only), so a plain `static mut`
 // matches the existing `SINGLETON_INIT` pattern in this file.
-static mut PUMP_ENTRY: Option<fn()> = None;
+static mut PUMP_ENTRY: Option<fn() -> i32> = None;
 
 pub(crate) fn has_pump_entry() -> bool {
     unsafe { PUMP_ENTRY.is_some() }
@@ -318,7 +319,9 @@ pub(crate) fn has_pump_entry() -> bool {
 
 pub(crate) fn run_pump_entry() {
     if let Some(entry) = unsafe { PUMP_ENTRY.take() } {
-        entry();
+        // Returning would hand control back to `UIApplicationMain`, whose run loop keeps the
+        // process alive without a running app. SDL's `postFinishLaunch` exits here too.
+        std::process::exit(entry());
     }
 }
 
