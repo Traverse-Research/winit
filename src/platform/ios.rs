@@ -9,6 +9,27 @@ use crate::{
     window::{Window, WindowBuilder},
 };
 
+/// Owns the process entry point on iOS.
+///
+/// iOS forbids returning from `UIApplicationMain`, so an app cannot create an [`EventLoop`] and call
+/// [`run`] from a normal `main`. Instead, `main` must call this function, which starts
+/// `UIApplicationMain` and — once the app has finished launching — invokes `entry` as a fresh
+/// run-loop callback. Create the [`EventLoop`] and call
+/// [`run_on_demand`](crate::platform::run_on_demand::EventLoopExtRunOnDemand::run_on_demand) or
+/// [`pump_events`](crate::platform::pump_events::EventLoopExtPumpEvents::pump_events) from within
+/// `entry`.
+///
+/// This mirrors SDL's iOS bootstrap (`SDL_UIKitRunApp` → `postFinishLaunch` → the user's `main`),
+/// including its exit: once `entry` returns, the process exits with its return value as the exit
+/// code, as it would when returning from `main` on other platforms.
+///
+/// This function never returns.
+///
+/// [`run`]: EventLoop::run
+pub fn ios_application_main(entry: fn() -> i32) -> ! {
+    crate::platform_impl::ios_application_main(entry)
+}
+
 /// Additional methods on [`EventLoop`] that are specific to iOS.
 pub trait EventLoopExtIOS {
     /// Returns the [`Idiom`] (phone/tablet/tv/etc) for the current device.

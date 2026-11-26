@@ -30,8 +30,8 @@ use windows_sys::Win32::{
     UI::{
         Input::{
             KeyboardAndMouse::{
-                EnableWindow, GetActiveWindow, MapVirtualKeyW, ReleaseCapture, SendInput,
-                ToUnicode, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+                EnableWindow, GetActiveWindow, GetFocus, MapVirtualKeyW, ReleaseCapture,
+                SendInput, SetFocus, ToUnicode, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
                 KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_LMENU, VK_MENU, VK_SPACE,
             },
             Touch::{RegisterTouchWindow, TWF_WANTPALM},
@@ -1004,6 +1004,12 @@ impl Window {
 
         if is_visible && !is_minimized && !is_foreground {
             unsafe { force_window_active(self.window) };
+        } else if is_visible && !is_minimized && unsafe { GetFocus() } != self.window {
+            // The window is in the foreground, but doesn't have keyboard focus. This happens when
+            // a focused child window, such as an embedded web view, is destroyed: Windows doesn't
+            // give focus back to the parent, and clicking the already active window doesn't
+            // either. Taking focus sends `WM_SETFOCUS`, which reports `WindowEvent::Focused`.
+            unsafe { SetFocus(self.window) };
         }
     }
 
